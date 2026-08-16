@@ -20,14 +20,14 @@ of choices to the user and waits for a decision before the agent proceeds.
 ## Install
 
 ```bash
-# As a package (from GitHub)
-pi install git:github.com/pmcc/pi-options@v0.1.0
+# As a package
+pi install git:gitea.itspm.cc/pmcc/pi-options
 
 # Or quick test without installing
-pi -e git:github.com/pmcc/pi-options
+pi -e git:gitea.itspm.cc/pmcc/pi-options
 
 # Or from a local checkout
-pi -e ./index.ts
+pi -e ./scr/index.ts
 ```
 
 ## Tool parameters
