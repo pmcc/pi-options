@@ -5,6 +5,8 @@ of choices to the user and waits for a decision before the agent proceeds.
 
 ## Behavior
 
+- The tool is only registered in interactive TUI sessions. In print/JSON/RPC
+  mode it never enters the system prompt, so the model cannot call it.
 - Choices are displayed as a numbered list (`1. Name`). The list always ends
   with an extra free-form message option that opens an inline editor.
 - **Single choice** (`multiple: false`, default): focus with Up/Down, confirm
