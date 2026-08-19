@@ -16,8 +16,10 @@ of choices to the user and waits for a decision before the agent proceeds.
   selects the currently focused option. Esc cancels.
 - The message option works in both modes: confirm it (single) or toggle it
   (multi) and press Enter to type a message that is returned as the result.
-- The tool result includes the full numbered list of available choices plus
-  the user's selection.
+- The tool result includes only the user's decision; choices already present in
+  the tool call are not repeated in model context.
+- Calls are limited to 20 choices. Prompts, labels, descriptions, and free-form
+  responses have bounded lengths to protect the model context.
 
 ## Install
 
@@ -29,7 +31,7 @@ pi install git:gitea.itspm.cc/pmcc/pi-options
 pi -e git:gitea.itspm.cc/pmcc/pi-options
 
 # Or from a local checkout
-pi -e ./scr/index.ts
+pi -e ./src/index.ts
 ```
 
 ## Tool parameters
