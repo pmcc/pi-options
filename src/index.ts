@@ -1,42 +1,34 @@
-/**
- * present-options
- *
- * Interactive tool that presents a numbered list of choices to the user and
- * waits for a decision before proceeding.
- *
- * Behavior:
- * - Choices are displayed as a numbered list ("1. Name"). The list always ends
- *   with an extra free-form message option that opens an inline editor.
- * - Single choice (multiple: false): move focus with Up/Down, confirm the
- *   focused option with Enter, cancel with Esc.
- * - Multiple choice (multiple: true): toggle options individually with Space,
- *   confirm the toggled set with Enter. If nothing is toggled, Enter selects
- *   the currently focused option. Esc cancels.
- * - The message option works in both modes: confirm it (single) or toggle it
- *   (multi) and press Enter to type a message that is returned as the result.
- */
-
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import {
+	CURSOR_MARKER,
 	Editor,
 	type EditorTheme,
 	type Focusable,
+	type KeybindingsManager,
 	Key,
 	matchesKey,
 	Text,
+	truncateToWidth,
+	type TUI,
 	visibleWidth,
-	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import {
+	buildContent,
+	capMessage,
+	MAX_MESSAGE_LENGTH,
+	sanitizeMultiline,
+	sanitizeSingleLine,
+	selectedInChoiceOrder,
+	visibleItemWindow,
+} from "./helpers.ts";
 
-// ---- Types ----
-
-interface Choice {
+export interface Choice {
 	name: string;
 	description?: string;
 }
 
-interface ListItem extends Choice {
+export interface ListItem extends Choice {
 	index: number;
 	isOther?: boolean;
 }
@@ -46,46 +38,23 @@ interface Pick {
 	message?: string;
 }
 
-interface PresentOptionsDetails {
-	selected: { index: number; name: string }[];
-	message?: string;
+interface PresentOptionsDetails extends Pick {
 	cancelled: boolean;
 }
 
-// ---- Schemas ----
+const nonBlank = { minLength: 1, pattern: "\\S" };
 
-const ChoiceSchema = Type.Object({
-	name: Type.String({ maxLength: 200 }),
-	description: Type.Optional(Type.String({ maxLength: 500 })),
+export const ChoiceSchema = Type.Object({
+	name: Type.String({ ...nonBlank, maxLength: 200 }),
+	description: Type.Optional(Type.String({ ...nonBlank, maxLength: 500 })),
 });
 
-const PresentOptionsParams = Type.Object({
-	prompt: Type.String({ maxLength: 1000 }),
+export const PresentOptionsParams = Type.Object({
+	prompt: Type.String({ ...nonBlank, maxLength: 1000 }),
 	choices: Type.Array(ChoiceSchema, { minItems: 1, maxItems: 20 }),
 	multiple: Type.Optional(Type.Boolean()),
-	messageLabel: Type.Optional(Type.String({ maxLength: 100 })),
+	messageLabel: Type.Optional(Type.String({ ...nonBlank, maxLength: 100 })),
 });
-
-// ---- Helpers ----
-
-const MAX_MESSAGE_LENGTH = 5000;
-
-function buildContent(result: {
-	cancelled: boolean;
-	selected: { index: number; name: string }[];
-	message?: string;
-}): string {
-	if (result.cancelled) return "User cancelled";
-
-	const parts: string[] = [];
-	if (result.selected.length > 0) {
-		parts.push(
-			`User selected:\n${result.selected.map((s) => `${s.index}. ${s.name}`).join("\n")}`,
-		);
-	}
-	if (result.message) parts.push(`User wrote:\n${result.message}`);
-	return parts.join("\n\n") || "User made no selection";
-}
 
 function errorResult(message: string): {
 	content: { type: "text"; text: string }[];
@@ -97,13 +66,307 @@ function errorResult(message: string): {
 	};
 }
 
-// ---- Tool ----
+function prettyKey(key: string): string {
+	return key
+		.split("+")
+		.map(
+			(part) =>
+				({ up: "↑", down: "↓", enter: "Enter", escape: "Esc", space: "Space" })[part] ?? part,
+		)
+		.join("+");
+}
 
-export default function presentOptions(pi: ExtensionAPI) {
+function keyName(
+	keybindings: KeybindingsManager,
+	action: Parameters<KeybindingsManager["getKeys"]>[0],
+): string {
+	const key = keybindings.getKeys(action)[0];
+	return key ? prettyKey(key) : "";
+}
+
+function normalizeChoices(choices: Choice[]): Choice[] {
+	return choices.map((choice) => ({
+		name: sanitizeSingleLine(choice.name),
+		description: choice.description
+			? sanitizeMultiline(choice.description).trim() || undefined
+			: undefined,
+	}));
+}
+
+export function createOptionsComponent(options: {
+	tui: TUI;
+	theme: Theme;
+	keybindings: KeybindingsManager;
+	prompt: string;
+	items: ListItem[];
+	multiple: boolean;
+	done: (result: Pick | null) => void;
+}): Focusable & {
+	render(width: number): string[];
+	invalidate(): void;
+	handleInput(data: string): void;
+} {
+	const { tui, theme, keybindings, prompt, items, multiple, done } = options;
+	let focus = 0;
+	let editMode = false;
+	let editorError: string | undefined;
+	let messageWasCapped = false;
+	let enforcingLimit = false;
+	let lastVisibleCount = 1;
+	const toggled = new Set<number>();
+	const otherIndex = items.length - 1;
+	let cachedWidth: number | undefined;
+	let cachedHeight: number | undefined;
+	let cachedLines: string[] | undefined;
+
+	const editorTheme: EditorTheme = {
+		borderColor: (text) => theme.fg("accent", text),
+		selectList: {
+			selectedPrefix: (text) => theme.fg("accent", text),
+			selectedText: (text) => theme.fg("accent", text),
+			description: (text) => theme.fg("muted", text),
+			scrollInfo: (text) => theme.fg("dim", text),
+			noMatch: (text) => theme.fg("warning", text),
+		},
+	};
+	const editor = new Editor(tui, editorTheme);
+
+	function refresh(): void {
+		cachedWidth = undefined;
+		cachedHeight = undefined;
+		cachedLines = undefined;
+		tui.requestRender();
+	}
+
+	function finish(message?: string): void {
+		done({
+			selected: selectedInChoiceOrder(toggled, items, otherIndex),
+			message,
+		});
+	}
+
+	editor.onChange = () => {
+		if (enforcingLimit) return;
+		const capped = capMessage(editor.getExpandedText());
+		if (capped.truncated) {
+			enforcingLimit = true;
+			editor.setText(capped.value);
+			enforcingLimit = false;
+			messageWasCapped = true;
+			editorError = `Input capped at ${MAX_MESSAGE_LENGTH.toLocaleString()} characters`;
+		}
+		refresh();
+	};
+
+	editor.onSubmit = (value) => {
+		if (!editMode) return;
+		const safeValue = sanitizeMultiline(capMessage(value).value).trim();
+		if (!safeValue) {
+			editMode = false;
+			editorError = undefined;
+			messageWasCapped = false;
+			editor.setText("");
+			refresh();
+			return;
+		}
+		finish(safeValue);
+	};
+
+	function openEditor(): void {
+		editMode = true;
+		editorError = undefined;
+		messageWasCapped = false;
+		editor.setText("");
+		refresh();
+	}
+
+	function handleInput(data: string): void {
+		if (editMode) {
+			if (keybindings.matches(data, "tui.select.cancel")) {
+				editMode = false;
+				editorError = undefined;
+				messageWasCapped = false;
+				editor.setText("");
+				refresh();
+				return;
+			}
+			editorError = messageWasCapped
+				? `Input capped at ${MAX_MESSAGE_LENGTH.toLocaleString()} characters`
+				: undefined;
+			editor.handleInput(data);
+			refresh();
+			return;
+		}
+
+		if (keybindings.matches(data, "tui.select.up")) {
+			focus = Math.max(0, focus - 1);
+			refresh();
+			return;
+		}
+		if (keybindings.matches(data, "tui.select.down")) {
+			focus = Math.min(items.length - 1, focus + 1);
+			refresh();
+			return;
+		}
+		if (keybindings.matches(data, "tui.select.pageUp")) {
+			focus = Math.max(0, focus - lastVisibleCount);
+			refresh();
+			return;
+		}
+		if (keybindings.matches(data, "tui.select.pageDown")) {
+			focus = Math.min(items.length - 1, focus + lastVisibleCount);
+			refresh();
+			return;
+		}
+
+		const confirmUsesSpace = keybindings.matches(" ", "tui.select.confirm");
+		const togglePressed = confirmUsesSpace
+			? data.toLowerCase() === "x"
+			: matchesKey(data, Key.space) || data === " ";
+		if (multiple && togglePressed) {
+			if (toggled.has(focus)) toggled.delete(focus);
+			else toggled.add(focus);
+			refresh();
+			return;
+		}
+
+		if (keybindings.matches(data, "tui.select.confirm")) {
+			if (multiple && toggled.size > 0) {
+				if (toggled.has(otherIndex)) openEditor();
+				else finish();
+			} else if (items[focus].isOther) {
+				openEditor();
+			} else {
+				done({ selected: [{ index: items[focus].index, name: items[focus].name }] });
+			}
+			return;
+		}
+
+		if (keybindings.matches(data, "tui.select.cancel")) done(null);
+	}
+
+	function render(width: number): string[] {
+		const renderWidth = Math.max(1, width);
+		const terminalRows = Math.max(1, tui.terminal.rows || 24);
+		const heightBudget = Math.max(1, Math.min(18, terminalRows - 4));
+		if (cachedLines && cachedWidth === renderWidth && cachedHeight === heightBudget)
+			return cachedLines;
+
+		const border = theme.fg("accent", "─".repeat(renderWidth));
+		const promptLine = truncateToWidth(
+			` ${theme.fg("text", sanitizeSingleLine(prompt))}`,
+			renderWidth,
+			"…",
+		);
+		let lines: string[] = [border, promptLine];
+
+		if (editMode) {
+			const submitKey = keyName(keybindings, "tui.input.submit") || "Enter";
+			const cancelKey = keyName(keybindings, "tui.select.cancel") || "Esc";
+			const count = Array.from(editor.getExpandedText()).length;
+			const chrome = heightBudget >= 8;
+			if (chrome) lines.push(theme.fg("muted", " Your message:"));
+			const reserved = lines.length + 1 + (chrome ? 2 : 0);
+			const editorRows = Math.max(1, heightBudget - reserved);
+			const renderedEditor = editor.render(Math.max(1, renderWidth - 1));
+			const cursorRow = renderedEditor.findIndex((line) => line.includes(CURSOR_MARKER));
+			const editorStart =
+				cursorRow < 0
+					? Math.max(0, renderedEditor.length - editorRows)
+					: Math.max(
+							0,
+							Math.min(cursorRow - Math.floor(editorRows / 2), renderedEditor.length - editorRows),
+						);
+			for (const line of renderedEditor.slice(editorStart, editorStart + editorRows)) {
+				lines.push(` ${line}`);
+			}
+			if (chrome) {
+				const status =
+					editorError ??
+					`${count.toLocaleString()}/${MAX_MESSAGE_LENGTH.toLocaleString()} characters`;
+				lines.push(theme.fg(editorError ? "warning" : "dim", ` ${status}`));
+				lines.push(theme.fg("dim", ` ${submitKey} submit • ${cancelKey} go back`));
+			}
+			lines.push(border);
+		} else {
+			const up = keyName(keybindings, "tui.select.up");
+			const down = keyName(keybindings, "tui.select.down");
+			const confirm = keyName(keybindings, "tui.select.confirm");
+			const cancel = keyName(keybindings, "tui.select.cancel");
+			const nav = [up, down].filter(Boolean).join("/");
+			const toggle = keybindings.matches(" ", "tui.select.confirm") ? "X" : "Space";
+			const help = multiple
+				? `${nav} navigate • ${toggle} toggle • ${confirm} confirm • ${cancel} cancel`
+				: `${nav} navigate • ${confirm} select • ${cancel} cancel`;
+			const listRows = Math.max(1, heightBudget - 4);
+			const showDescriptions = listRows >= 4;
+			const heights = items.map((item) => (showDescriptions && item.description ? 2 : 1));
+			const needsScroll = heights.reduce((sum, height) => sum + height, 0) > listRows;
+			const itemRows = Math.max(1, listRows - (needsScroll ? 1 : 0));
+			const [start, end] = visibleItemWindow(heights, focus, itemRows);
+			lastVisibleCount = Math.max(1, end - start);
+			const numberWidth = String(items.length).length;
+
+			for (let index = start; index < end; index++) {
+				const item = items[index];
+				const focused = index === focus;
+				const selected = multiple && toggled.has(index);
+				let prefix = focused ? theme.fg("accent", "> ") : "  ";
+				if (multiple) {
+					const box = selected ? theme.fg("success", "[x]") : theme.fg("muted", "[ ]");
+					prefix += `${box} `;
+				}
+				const number = `${String(item.index).padStart(numberWidth)}.`;
+				const label = `${number} ${item.name}`;
+				lines.push(
+					truncateToWidth(prefix + theme.fg(focused ? "accent" : "text", label), renderWidth, "…"),
+				);
+				if (showDescriptions && item.description) {
+					const indent = " ".repeat(Math.min(renderWidth, visibleWidth(prefix)));
+					lines.push(
+						truncateToWidth(
+							indent + theme.fg("muted", item.description.replace(/\n+/g, " ")),
+							renderWidth,
+							"…",
+						),
+					);
+				}
+			}
+			if (needsScroll) {
+				lines.push(theme.fg("dim", ` Showing ${start + 1}–${end} of ${items.length}`));
+			}
+			lines.push(theme.fg("dim", ` ${help}`));
+			lines.push(border);
+		}
+
+		lines = lines.slice(0, heightBudget).map((line) => truncateToWidth(line, renderWidth, ""));
+		cachedWidth = renderWidth;
+		cachedHeight = heightBudget;
+		cachedLines = lines;
+		return lines;
+	}
+
+	return {
+		get focused() {
+			return editor.focused;
+		},
+		set focused(value: boolean) {
+			editor.focused = value;
+		},
+		render,
+		invalidate() {
+			cachedWidth = undefined;
+			cachedHeight = undefined;
+			cachedLines = undefined;
+			editor.invalidate();
+		},
+		handleInput,
+	};
+}
+
+export default function presentOptions(pi: ExtensionAPI): void {
 	let registered = false;
 
-	// The options UI needs a terminal; in print/json/rpc sessions the call can
-	// only fail, so the tool is never registered there and stays out of the prompt.
 	pi.on("session_start", (_event, ctx) => {
 		if (registered || ctx.mode !== "tui") return;
 		registered = true;
@@ -111,342 +374,84 @@ export default function presentOptions(pi: ExtensionAPI) {
 			name: "present_options",
 			label: "Present Options",
 			description:
-				"Ask the user to choose from a numbered list before proceeding. The user can also " +
-				"enter a free-form response. Set multiple=true to allow multiple choices.",
+				"Ask the user to choose from a numbered list before proceeding. The user can also enter a free-form response of up to 5,000 characters. Set multiple=true to allow multiple choices.",
 			parameters: PresentOptionsParams,
 			executionMode: "sequential",
 
 			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-				const choices: Choice[] = params.choices;
-				if (ctx.mode !== "tui") {
-					return errorResult(
-						"Error: UI not available (running in non-interactive mode)",
-					);
-				}
-				if (choices.length === 0) {
-					return errorResult("Error: No choices provided");
-				}
+				if (ctx.mode !== "tui")
+					return errorResult("Error: UI not available (running in non-interactive mode)");
+				if (params.choices.length === 0) return errorResult("Error: No choices provided");
 
+				const choices = normalizeChoices(params.choices as Choice[]);
+				const prompt = sanitizeMultiline(params.prompt).trim();
+				if (!prompt) return errorResult("Error: Prompt is empty after sanitization");
+				if (choices.some((choice) => !choice.name)) {
+					return errorResult("Error: A choice name is empty after sanitization");
+				}
 				const multiple = params.multiple === true;
-				const messageLabel = params.messageLabel || "Enter a message…";
+				const messageLabel =
+					sanitizeSingleLine(params.messageLabel ?? "Enter a message…") || "Enter a message…";
+				const items: ListItem[] = choices.map((choice, index) => ({ ...choice, index: index + 1 }));
+				items.push({ name: messageLabel, index: items.length + 1, isOther: true });
 
-				const result = await ctx.ui.custom<Pick | null>(
-					(tui, theme, _kb, done) => {
-						let focus = 0;
-						let editMode = false;
-						let editorError: string | undefined;
-						const toggled = new Set<number>(); // indexes into items
-						let cachedWidth: number | undefined;
-						let cachedLines: string[] | undefined;
-
-						const items: ListItem[] = choices.map((c, i) => ({
-							...c,
-							index: i + 1,
-						}));
-						const otherIndex = items.length;
-						items.push({
-							name: messageLabel,
-							index: otherIndex + 1,
-							isOther: true,
-						});
-
-						const editorTheme: EditorTheme = {
-							borderColor: (s) => theme.fg("accent", s),
-							selectList: {
-								selectedPrefix: (t) => theme.fg("accent", t),
-								selectedText: (t) => theme.fg("accent", t),
-								description: (t) => theme.fg("muted", t),
-								scrollInfo: (t) => theme.fg("dim", t),
-								noMatch: (t) => theme.fg("warning", t),
-							},
-						};
-						const editor = new Editor(tui, editorTheme);
-
-						function refresh() {
-							cachedWidth = undefined;
-							cachedLines = undefined;
-							tui.requestRender();
-						}
-
-						function finish(message?: string) {
-							done({
-								selected: [...toggled]
-									.filter((i) => i !== otherIndex)
-									.map((i) => ({ index: items[i].index, name: items[i].name })),
-								message,
-							});
-						}
-
-						editor.onSubmit = (value) => {
-							if (!editMode) return;
-							const trimmed = value.trim();
-							if (!trimmed) {
-								editMode = false;
-								editorError = undefined;
-								editor.setText("");
-								refresh();
-								return;
-							}
-							if (trimmed.length > MAX_MESSAGE_LENGTH) {
-								editorError = `Message must be ${MAX_MESSAGE_LENGTH.toLocaleString()} characters or fewer`;
-								refresh();
-								return;
-							}
-							finish(trimmed);
-						};
-
-						function handleInput(data: string) {
-							// Editor mode: type the message
-							if (editMode) {
-								if (matchesKey(data, Key.escape)) {
-									editMode = false;
-									editorError = undefined;
-									editor.setText("");
-									refresh();
-									return;
-								}
-								editorError = undefined;
-								editor.handleInput(data);
-								refresh();
-								return;
-							}
-
-							// Navigation
-							if (matchesKey(data, Key.up)) {
-								focus = Math.max(0, focus - 1);
-								refresh();
-								return;
-							}
-							if (matchesKey(data, Key.down)) {
-								focus = Math.min(items.length - 1, focus + 1);
-								refresh();
-								return;
-							}
-
-							// Toggle (multi mode only)
-							if (multiple && (matchesKey(data, Key.space) || data === " ")) {
-								if (toggled.has(focus)) toggled.delete(focus);
-								else toggled.add(focus);
-								refresh();
-								return;
-							}
-
-							// Confirm
-							if (matchesKey(data, Key.enter)) {
-								if (multiple && toggled.size > 0) {
-									// Toggled set wins; open the editor if the message option is toggled
-									if (toggled.has(otherIndex)) {
-										editMode = true;
-										editor.setText("");
-										refresh();
-									} else {
-										finish();
-									}
-								} else if (items[focus].isOther) {
-									// Focused message option: open the editor
-									editMode = true;
-									editor.setText("");
-									refresh();
-								} else {
-									done({
-										selected: [
-											{ index: items[focus].index, name: items[focus].name },
-										],
-									});
-								}
-								return;
-							}
-
-							// Cancel
-							if (matchesKey(data, Key.escape)) {
-								done(null);
-							}
-						}
-
-						function render(width: number): string[] {
-							const renderWidth = Math.max(1, width);
-							if (cachedLines && cachedWidth === renderWidth)
-								return cachedLines;
-
-							const lines: string[] = [];
-
-							function addWrapped(text: string) {
-								lines.push(...wrapTextWithAnsi(text, renderWidth));
-							}
-
-							function addWrappedWithPrefix(prefix: string, text: string) {
-								const prefixWidth = visibleWidth(prefix);
-								if (prefixWidth >= renderWidth) {
-									addWrapped(prefix + text);
-									return;
-								}
-								const wrapped = wrapTextWithAnsi(
-									text,
-									renderWidth - prefixWidth,
-								);
-								const continuationPrefix = " ".repeat(prefixWidth);
-								for (let i = 0; i < wrapped.length; i++) {
-									lines.push(
-										`${i === 0 ? prefix : continuationPrefix}${wrapped[i]}`,
-									);
-								}
-							}
-
-							lines.push(theme.fg("accent", "─".repeat(renderWidth)));
-							addWrappedWithPrefix(" ", theme.fg("text", params.prompt));
-							lines.push("");
-
-							const numberWidth = String(items.length).length;
-							for (let i = 0; i < items.length; i++) {
-								const item = items[i];
-								const isFocused = i === focus;
-								const isToggled = multiple && toggled.has(i);
-								const num = `${String(item.index).padStart(numberWidth)}.`;
-								const label = `${num} ${item.name}${item.isOther && editMode ? " ✎" : ""}`;
-								const color = isFocused ? "accent" : "text";
-
-								let prefix = isFocused ? theme.fg("accent", "> ") : "  ";
-								if (multiple) {
-									const box = isToggled
-										? theme.fg("success", "[x]")
-										: theme.fg("muted", "[ ]");
-									prefix += `${box} `;
-								}
-								addWrappedWithPrefix(prefix, theme.fg(color, label));
-								if (item.description) {
-									addWrappedWithPrefix(
-										" ".repeat(visibleWidth(prefix)),
-										theme.fg("muted", item.description),
-									);
-								}
-							}
-
-							if (editMode) {
-								lines.push("");
-								addWrappedWithPrefix(" ", theme.fg("muted", "Your message:"));
-								const indent = renderWidth > 1 ? " " : "";
-								for (const line of editor.render(
-									Math.max(1, renderWidth - indent.length),
-								)) {
-									lines.push(`${indent}${line}`);
-								}
-								if (editorError) {
-									addWrappedWithPrefix(" ", theme.fg("warning", editorError));
-								}
-							}
-
-							lines.push("");
-							if (editMode) {
-								addWrappedWithPrefix(
-									" ",
-									theme.fg("dim", "Enter to submit • Esc to go back"),
-								);
-							} else if (multiple) {
-								addWrappedWithPrefix(
-									" ",
-									theme.fg(
-										"dim",
-										"↑↓ navigate • Space toggle • Enter confirm • Esc cancel",
-									),
-								);
-							} else {
-								addWrappedWithPrefix(
-									" ",
-									theme.fg("dim", "↑↓ navigate • Enter select • Esc cancel"),
-								);
-							}
-							lines.push(theme.fg("accent", "─".repeat(renderWidth)));
-
-							cachedWidth = renderWidth;
-							cachedLines = lines;
-							return lines;
-						}
-
-						const component: Focusable & {
-							render: typeof render;
-							invalidate: () => void;
-							handleInput: typeof handleInput;
-						} = {
-							get focused() {
-								return editor.focused;
-							},
-							set focused(value: boolean) {
-								editor.focused = value;
-							},
-							render,
-							invalidate: () => {
-								cachedWidth = undefined;
-								cachedLines = undefined;
-								editor.invalidate();
-							},
-							handleInput,
-						};
-						return component;
-					},
+				const result = await ctx.ui.custom<Pick | null>((tui, theme, keybindings, done) =>
+					createOptionsComponent({ tui, theme, keybindings, prompt, items, multiple, done }),
 				);
-
-				const resultInfo = {
+				const resultInfo: PresentOptionsDetails = {
 					cancelled: result === null,
 					selected: result?.selected ?? [],
 					message: result?.message,
 				};
-
 				return {
-					content: [
-						{
-							type: "text",
-							text: buildContent(resultInfo),
-						},
-					],
-					details: {
-						selected: resultInfo.selected,
-						message: resultInfo.message,
-						cancelled: resultInfo.cancelled,
-					} as PresentOptionsDetails,
+					content: [{ type: "text", text: buildContent(resultInfo) }],
+					details: resultInfo,
 				};
 			},
 
-			renderCall(args, theme, _context) {
-				let text =
-					theme.fg("toolTitle", theme.bold("present_options ")) +
-					theme.fg("muted", args.prompt);
-				const cs = Array.isArray(args.choices)
-					? (args.choices as Choice[])
+			renderCall(args, theme, context) {
+				const prompt = sanitizeMultiline(args.prompt).trim();
+				const choices = Array.isArray(args.choices)
+					? normalizeChoices(args.choices as Choice[])
 					: [];
-				if (cs.length) {
-					const numbered = cs.map((c, i) => `${i + 1}. ${c.name}`);
-					numbered.push(
-						`${cs.length + 1}. ${args.messageLabel || "Enter a message…"}`,
+				const messageLabel =
+					sanitizeSingleLine(args.messageLabel ?? "Enter a message…") || "Enter a message…";
+				let text =
+					theme.fg("toolTitle", theme.bold("present_options ")) + theme.fg("muted", prompt);
+				if (!context.expanded) {
+					const mode = args.multiple === true ? ", multiple" : "";
+					text += theme.fg(
+						"dim",
+						` (${choices.length} choice${choices.length === 1 ? "" : "s"}${mode})`,
 					);
-					text += `\n${theme.fg("dim", `  ${numbered.join(", ")}`)}`;
+					return new Text(text, 0, 0);
 				}
+				for (let index = 0; index < choices.length; index++) {
+					text += `\n${theme.fg("dim", `  ${index + 1}. `)}${theme.fg("text", choices[index].name)}`;
+					if (choices[index].description)
+						text += `\n${theme.fg("dim", `     ${choices[index].description}`)}`;
+				}
+				text += `\n${theme.fg("dim", `  ${choices.length + 1}. `)}${theme.fg("text", messageLabel)}`;
 				return new Text(text, 0, 0);
 			},
 
 			renderResult(result, _options, theme, _context) {
 				const details = result.details as PresentOptionsDetails | undefined;
 				if (!details) {
-					const text = result.content[0];
-					return new Text(text?.type === "text" ? text.text : "", 0, 0);
+					const content = result.content[0];
+					return new Text(sanitizeMultiline(content?.type === "text" ? content.text : ""), 0, 0);
 				}
-				if (details.cancelled) {
-					return new Text(theme.fg("warning", "Cancelled"), 0, 0);
-				}
-				const parts: string[] = [];
-				for (const s of details.selected) {
-					parts.push(
-						`${theme.fg("success", "✓ ")}${theme.fg("accent", `${s.index}. ${s.name}`)}`,
-					);
-				}
+				if (details.cancelled) return new Text(theme.fg("warning", "Cancelled"), 0, 0);
+				const parts = details.selected.map(
+					(selection) =>
+						`${theme.fg("success", "✓ ")}${theme.fg("accent", `${selection.index}. ${sanitizeSingleLine(selection.name)}`)}`,
+				);
 				if (details.message) {
 					parts.push(
-						`${theme.fg("success", "✓ ")}${theme.fg("muted", "(wrote) ")}${theme.fg("accent", details.message)}`,
+						`${theme.fg("success", "✓ ")}${theme.fg("muted", "(wrote) ")}${theme.fg("accent", sanitizeMultiline(details.message))}`,
 					);
 				}
-				if (parts.length === 0) {
-					return new Text(theme.fg("warning", "No selection"), 0, 0);
-				}
-				return new Text(parts.join("\n"), 0, 0);
+				return new Text(parts.join("\n") || theme.fg("warning", "No selection"), 0, 0);
 			},
 		});
 	});
