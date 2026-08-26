@@ -11,6 +11,7 @@ import {
 	truncateToWidth,
 	type TUI,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
@@ -93,6 +94,15 @@ function normalizeChoices(choices: Choice[]): Choice[] {
 	}));
 }
 
+function wrapPrefixedText(prefix: string, text: string, width: number): string[] {
+	const prefixWidth = visibleWidth(prefix);
+	if (width - prefixWidth < 2) return wrapTextWithAnsi(prefix + text, width);
+
+	const wrapped = wrapTextWithAnsi(text, width - prefixWidth);
+	const continuationPrefix = " ".repeat(prefixWidth);
+	return wrapped.map((line, index) => (index === 0 ? prefix : continuationPrefix) + line);
+}
+
 export function createOptionsComponent(options: {
 	tui: TUI;
 	theme: Theme;
@@ -113,6 +123,9 @@ export function createOptionsComponent(options: {
 	let messageWasCapped = false;
 	let enforcingLimit = false;
 	let lastVisibleCount = 1;
+	let focusedLineOffset = 0;
+	let lastFocusedHeight = 1;
+	let lastFocusedPageRows = 1;
 	const toggled = new Set<number>();
 	const otherIndex = items.length - 1;
 	let cachedWidth: number | undefined;
@@ -200,21 +213,33 @@ export function createOptionsComponent(options: {
 
 		if (keybindings.matches(data, "tui.select.up")) {
 			focus = Math.max(0, focus - 1);
+			focusedLineOffset = 0;
 			refresh();
 			return;
 		}
 		if (keybindings.matches(data, "tui.select.down")) {
 			focus = Math.min(items.length - 1, focus + 1);
+			focusedLineOffset = 0;
 			refresh();
 			return;
 		}
 		if (keybindings.matches(data, "tui.select.pageUp")) {
-			focus = Math.max(0, focus - lastVisibleCount);
+			if (focusedLineOffset > 0) {
+				focusedLineOffset = Math.max(0, focusedLineOffset - lastFocusedPageRows);
+			} else {
+				focus = Math.max(0, focus - lastVisibleCount);
+				focusedLineOffset = 0;
+			}
 			refresh();
 			return;
 		}
 		if (keybindings.matches(data, "tui.select.pageDown")) {
-			focus = Math.min(items.length - 1, focus + lastVisibleCount);
+			if (focusedLineOffset + lastFocusedPageRows < lastFocusedHeight) {
+				focusedLineOffset += lastFocusedPageRows;
+			} else {
+				focus = Math.min(items.length - 1, focus + lastVisibleCount);
+				focusedLineOffset = 0;
+			}
 			refresh();
 			return;
 		}
@@ -293,22 +318,16 @@ export function createOptionsComponent(options: {
 			const down = keyName(keybindings, "tui.select.down");
 			const confirm = keyName(keybindings, "tui.select.confirm");
 			const cancel = keyName(keybindings, "tui.select.cancel");
+			const pageUp = keyName(keybindings, "tui.select.pageUp") || "PageUp";
+			const pageDown = keyName(keybindings, "tui.select.pageDown") || "PageDown";
 			const nav = [up, down].filter(Boolean).join("/");
 			const toggle = keybindings.matches(" ", "tui.select.confirm") ? "X" : "Space";
 			const help = multiple
 				? `${nav} navigate • ${toggle} toggle • ${confirm} confirm • ${cancel} cancel`
 				: `${nav} navigate • ${confirm} select • ${cancel} cancel`;
 			const listRows = Math.max(1, heightBudget - 4);
-			const showDescriptions = listRows >= 4;
-			const heights = items.map((item) => (showDescriptions && item.description ? 2 : 1));
-			const needsScroll = heights.reduce((sum, height) => sum + height, 0) > listRows;
-			const itemRows = Math.max(1, listRows - (needsScroll ? 1 : 0));
-			const [start, end] = visibleItemWindow(heights, focus, itemRows);
-			lastVisibleCount = Math.max(1, end - start);
 			const numberWidth = String(items.length).length;
-
-			for (let index = start; index < end; index++) {
-				const item = items[index];
+			const renderedItems = items.map((item, index) => {
 				const focused = index === focus;
 				const selected = multiple && toggled.has(index);
 				let prefix = focused ? theme.fg("accent", "> ") : "  ";
@@ -316,23 +335,50 @@ export function createOptionsComponent(options: {
 					const box = selected ? theme.fg("success", "[x]") : theme.fg("muted", "[ ]");
 					prefix += `${box} `;
 				}
-				const number = `${String(item.index).padStart(numberWidth)}.`;
-				const label = `${number} ${item.name}`;
-				lines.push(
-					truncateToWidth(prefix + theme.fg(focused ? "accent" : "text", label), renderWidth, "…"),
+				const number = `${String(item.index).padStart(numberWidth)}. `;
+				const labelPrefix = prefix + theme.fg(focused ? "accent" : "text", number);
+				const itemLines = wrapPrefixedText(
+					labelPrefix,
+					theme.fg(focused ? "accent" : "text", item.name),
+					renderWidth,
 				);
-				if (showDescriptions && item.description) {
-					const indent = " ".repeat(Math.min(renderWidth, visibleWidth(prefix)));
-					lines.push(
-						truncateToWidth(
-							indent + theme.fg("muted", item.description.replace(/\n+/g, " ")),
-							renderWidth,
-							"…",
-						),
+				if (item.description) {
+					const indent = " ".repeat(visibleWidth(labelPrefix));
+					itemLines.push(
+						...wrapPrefixedText(indent, theme.fg("muted", item.description), renderWidth),
 					);
 				}
+				return itemLines;
+			});
+			const heights = renderedItems.map((itemLines) => itemLines.length);
+			const needsScroll = heights.reduce((sum, height) => sum + height, 0) > listRows;
+			const itemRows = Math.max(1, listRows - (needsScroll ? 1 : 0));
+			lastFocusedHeight = heights[focus] ?? 1;
+			lastFocusedPageRows = Math.min(itemRows, lastFocusedHeight);
+			focusedLineOffset = Math.min(focusedLineOffset, Math.max(0, lastFocusedHeight - 1));
+			const windowHeights = [...heights];
+			windowHeights[focus] = lastFocusedPageRows;
+			const [start, end] = visibleItemWindow(windowHeights, focus, itemRows);
+			lastVisibleCount = Math.max(1, end - start);
+
+			for (let index = start; index < end; index++) {
+				const itemLines = renderedItems[index];
+				lines.push(
+					...(index === focus
+						? itemLines.slice(focusedLineOffset, focusedLineOffset + lastFocusedPageRows)
+						: itemLines),
+				);
 			}
-			if (needsScroll) {
+			if (lastFocusedHeight > lastFocusedPageRows) {
+				const firstLine = focusedLineOffset + 1;
+				const lastLine = Math.min(lastFocusedHeight, focusedLineOffset + lastFocusedPageRows);
+				lines.push(
+					theme.fg(
+						"dim",
+						` Option ${focus + 1}, lines ${firstLine}–${lastLine} of ${lastFocusedHeight} • ${pageUp}/${pageDown} for more`,
+					),
+				);
+			} else if (needsScroll) {
 				lines.push(theme.fg("dim", ` Showing ${start + 1}–${end} of ${items.length}`));
 			}
 			lines.push(theme.fg("dim", ` ${help}`));

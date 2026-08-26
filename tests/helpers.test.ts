@@ -73,7 +73,11 @@ describe("list viewport", () => {
 		}
 	});
 
-	it("rejects an item that cannot fit in the row budget", () => {
+	it("rejects a focused item that cannot fit in the row budget", () => {
 		expect(() => visibleItemWindow([2], 0, 1)).toThrow(RangeError);
+	});
+
+	it("ignores an oversized non-focused item until it receives focus", () => {
+		expect(visibleItemWindow([1, 5, 1], 0, 2)).toEqual([0, 1]);
 	});
 });

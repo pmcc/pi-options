@@ -116,10 +116,10 @@ export function visibleItemWindow(
 	maxRows: number,
 ): [number, number] {
 	if (heights.length === 0 || maxRows <= 0) return [0, 0];
-	if (heights.some((height) => height > maxRows)) {
-		throw new RangeError("Each item must fit within maxRows");
-	}
 	const safeFocus = Math.max(0, Math.min(heights.length - 1, focus));
+	if (heights[safeFocus] > maxRows) {
+		throw new RangeError("The focused item must fit within maxRows");
+	}
 	let start = safeFocus;
 	let end = safeFocus + 1;
 	let used = heights[safeFocus] ?? 1;

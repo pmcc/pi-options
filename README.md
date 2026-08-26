@@ -15,8 +15,10 @@ of choices to the user and waits for a decision before the agent proceeds.
   with the configured selection key. If nothing is toggled, confirmation
   selects the focused option. Returned choices are ordered as displayed, not
   by the order in which they were toggled.
-- Long lists use a focus-following viewport and support the configured page-up
-  and page-down selection keys.
+- Displayed option labels and descriptions wrap instead of being truncated.
+  Options taller than the viewport can be paged through. Long lists use a
+  focus-following viewport and support the configured page-up and page-down
+  selection keys.
 - Selection navigation, confirmation, and cancellation respect pi's
   `keybindings.json`. On-screen hints show the active bindings.
 - Free-form responses are capped while typing at 5,000 characters. A live
